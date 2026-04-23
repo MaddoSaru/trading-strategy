@@ -1,0 +1,22 @@
+# Environment
+.env
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.ruff_cache/
+
+# Data
+data/*/
+!data/.gitkeep
+
+# System
+.DS_Store
+
+# Notebooks
+notebooks/.ipynb_checkpoints/
