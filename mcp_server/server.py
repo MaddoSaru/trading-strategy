@@ -2,12 +2,17 @@
 FastMCP server exposing trading strategy tools to Claude.
 
 Tools:
-- get_tv_analysis       — TradingView recommendation + indicators for any symbol
-- fetch_historical_data — Download & cache OHLCV via yfinance
-- get_current_signals   — Run all strategies on latest data, return signals
-- backtest_strategy     — Backtest a single strategy, return performance metrics
-- compare_strategies    — Compare all strategies on same asset/interval
-- list_strategies       — List available strategies and their parameters
+- get_tv_analysis         — TradingView recommendation + indicators for any symbol
+- fetch_historical_data   — Download & cache OHLCV via yfinance
+- get_current_signals     — Run all strategies on latest data, return signals
+- backtest_strategy       — Backtest a single strategy, return performance metrics
+- compare_strategies      — Compare all strategies on same asset/interval
+- list_strategies         — List available strategies and their parameters
+- get_paper_portfolio     — Paper trading portfolio snapshot with P&L
+- get_paper_trades        — Paper trading trade log
+- execute_paper_order     — Manually execute a paper BUY or SELL
+- run_paper_poll          — Check combined signals and execute paper trades
+- reset_paper_portfolio   — Wipe paper portfolio and start fresh
 """
 
 import sys
@@ -333,6 +338,208 @@ def list_strategies() -> dict:
         }
 
     return {"strategies": strategies, "assets": ASSETS}
+
+
+@mcp.tool()
+def get_paper_portfolio() -> dict:
+    """
+    Get the current paper trading portfolio: cash, open positions with unrealized P&L,
+    total equity, and overall return since inception.
+    """
+    try:
+        from paper_trading.engine import PaperTradingEngine
+
+        engine = PaperTradingEngine()
+        current_prices = {}
+        for asset, symbol in ASSETS.items():
+            try:
+                df = _load_or_fetch(symbol, "1d", "2y", refresh=False)
+                current_prices[symbol] = float(df.iloc[-1]["close"])
+            except Exception:
+                pass
+        return engine.get_portfolio_snapshot(current_prices)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_paper_trades(limit: int = 20) -> dict:
+    """
+    Get the paper trading trade log, most recent first.
+    limit: number of trades to return (default 20).
+    """
+    try:
+        from paper_trading.engine import PaperTradingEngine
+
+        engine = PaperTradingEngine()
+        trades = engine.get_trades(limit=limit)
+        return {"trades": trades, "count": len(trades)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def execute_paper_order(
+    asset: str = "nasdaq",
+    action: str = "BUY",
+    signal_source: str = "manual",
+) -> dict:
+    """
+    Manually execute a paper trade (BUY or SELL) at the current daily close price.
+    asset: "nasdaq" (QQQ) or "sp500" (SPY).
+    action: "BUY" or "SELL".
+    signal_source: label to record in the trade log.
+    """
+    try:
+        from paper_trading.engine import PaperTradingEngine
+
+        symbol = ASSETS.get(asset, asset.upper())
+        df = _load_or_fetch(symbol, "1d", "2y", refresh=False)
+        price = float(df.iloc[-1]["close"])
+        engine = PaperTradingEngine()
+        return engine.execute_order(symbol, asset, action.upper(), price, signal_source)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def run_paper_poll(
+    assets: list[str] | None = None,
+    interval: str = "1d",
+    period: str = "2y",
+    buy_threshold: int = 3,
+    sell_threshold: int = 2,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Check combined signals (TradingView + all strategies) and execute paper trades
+    when vote thresholds are met.
+
+    Voting: TV STRONG_BUY=2, BUY=1, SELL=1, STRONG_SELL=2; each strategy BUY/SELL=1 vote.
+    Max 6 BUY votes and 6 SELL votes total.
+    buy_threshold: min BUY votes to execute a BUY (default 3).
+    sell_threshold: min SELL votes to execute a SELL (default 2).
+    dry_run: return signals without executing any trades.
+    """
+    try:
+        from paper_trading.engine import PaperTradingEngine
+        from paper_trading.signals import get_combined_signal
+
+        if assets is None:
+            assets = ["nasdaq", "sp500"]
+
+        engine = PaperTradingEngine()
+        results = {}
+
+        for asset in assets:
+            symbol = ASSETS.get(asset, asset.upper())
+            signal = get_combined_signal(asset, interval, period, buy_threshold, sell_threshold)
+            action = signal["action"]
+
+            df = _load_or_fetch(symbol, interval, period, refresh=False)
+            price = float(df.iloc[-1]["close"])
+
+            tv_rec = signal["breakdown"]["tradingview"]["recommendation"]
+            strategies = signal["breakdown"]["strategies"]
+            active = [k for k, v in strategies.items() if v == action] if action != "HOLD" else []
+            source = f"poll|tv:{tv_rec}|strategies:{','.join(active) or 'none'}"
+
+            order = None
+            if not dry_run and action in ("BUY", "SELL"):
+                order = engine.execute_order(symbol, asset, action, price, signal_source=source)
+
+            results[asset] = {
+                "symbol": symbol,
+                "price": round(price, 4),
+                "signal": signal,
+                "order": order,
+            }
+
+        return {"assets": results, "dry_run": dry_run}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_strategy_params() -> dict:
+    """
+    Show the currently active parameters for all strategies.
+    These are either optimizer-tuned values (after enough SELL trades have occurred)
+    or the strategy defaults (before first optimization).
+    Also shows when each strategy was last optimized and its backtest performance.
+    """
+    try:
+        import json
+        from paper_trading.optimizer import _ensure_table, DEFAULT_PARAMS
+        from sqlalchemy import text
+
+        result = {}
+        with get_engine().connect() as conn:
+            _ensure_table(conn)
+            rows = conn.execute(text(
+                "SELECT * FROM paper_strategy_params"
+            )).fetchall()
+
+        stored = {row._mapping["strategy_name"]: dict(row._mapping) for row in rows}
+
+        for name in REGISTRY:
+            if name in stored:
+                r = stored[name]
+                result[name] = {
+                    "params": json.loads(r["params_json"]),
+                    "source": "optimized",
+                    "sharpe_ratio": r["sharpe_ratio"],
+                    "total_return_pct": r["total_return_pct"],
+                    "optimized_at": str(r["optimized_at"]),
+                    "sell_count_at_optimization": r["sell_count_at_optimization"],
+                }
+            else:
+                result[name] = {
+                    "params": DEFAULT_PARAMS.get(name, {}),
+                    "source": "default",
+                    "sharpe_ratio": None,
+                    "total_return_pct": None,
+                    "optimized_at": None,
+                    "sell_count_at_optimization": 0,
+                }
+
+        return {"strategies": result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def optimize_strategies(
+    asset: str = "nasdaq",
+    interval: str = "1d",
+    period: str = "1y",
+) -> dict:
+    """
+    Manually trigger a parameter grid search for all strategies.
+    Tests all parameter combinations via backtests on recent data and saves the best
+    params (by Sharpe ratio) to paper_strategy_params.
+    Results are used immediately on the next poll or signal check.
+    """
+    try:
+        from paper_trading.optimizer import optimize_all
+        return optimize_all(asset=asset, interval=interval, period=period)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def reset_paper_portfolio(initial_capital: float = 10_000.0) -> dict:
+    """
+    Wipe all paper trading data (portfolio, positions, trades) and start fresh
+    with the given initial capital.
+    """
+    try:
+        from paper_trading.engine import PaperTradingEngine
+
+        engine = PaperTradingEngine()
+        return engine.reset(initial_capital)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def main():

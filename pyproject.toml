@@ -22,12 +22,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["etl", "indicators", "strategies", "backtest", "mcp_server"]
+packages = ["etl", "indicators", "strategies", "backtest", "mcp_server", "paper_trading"]
 
 [project.scripts]
 trading-fetch = "etl.pipeline:cli"
 trading-backtest = "backtest.engine:cli"
 trading-mcp = "mcp_server.server:main"
+trading-paper = "paper_trading.poller:poll"
 
 [dependency-groups]
 dev = [
